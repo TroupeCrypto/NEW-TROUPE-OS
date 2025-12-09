@@ -78,7 +78,7 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`TROUPE-OS API server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`Database URL configured: ${process.env.DATABASE_URL ? 'Yes' : 'No'}`);
@@ -87,8 +87,11 @@ app.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM signal received: closing HTTP server');
-  db.pool.end(() => {
-    console.log('Database pool closed');
-    process.exit(0);
+  server.close(() => {
+    console.log('HTTP server closed');
+    db.pool.end(() => {
+      console.log('Database pool closed');
+      process.exit(0);
+    });
   });
 });
