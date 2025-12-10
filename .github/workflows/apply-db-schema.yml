@@ -1,0 +1,37 @@
+name: Apply DB schema
+
+on:
+  workflow_dispatch:  # manual trigger from Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  apply-schema:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Apply schema.sql to Railway DB
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          # adjust path if your schema file lives somewhere else
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "DATABASE_URL secret is required" >&2
+            exit 1
+          fi
+          if [ ! -f infra/db/schema.sql ]; then
+            echo "Schema file not found at infra/db/schema.sql" >&2
+            exit 1
+          fi
+          export PGCONNECT_TIMEOUT=30
+          export PGOPTIONS='-c statement_timeout=300000'
+          echo "Applying schema from infra/db/schema.sql"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f infra/db/schema.sql
