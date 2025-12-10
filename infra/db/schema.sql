@@ -2,7 +2,7 @@
 -- Authoritative data backbone for Troupe OS
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "vector";
+-- CREATE EXTENSION IF NOT EXISTS "vector";  -- disabled: not available on Railway managed Postgres
 
 -- =========================
 -- USERS & IDENTITY
@@ -107,10 +107,12 @@ CREATE TABLE asset_tags (
     UNIQUE (asset_id, tag)
 );
 
+-- NOTE: embedding stored as a float array instead of pgvector::vector(1536)
+-- This keeps the data model but drops native vector indexing for now.
 CREATE TABLE asset_embeddings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     asset_id UUID NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-    embedding VECTOR(1536),
+    embedding double precision[], -- was VECTOR(1536)
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
