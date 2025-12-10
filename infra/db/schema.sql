@@ -2,7 +2,6 @@
 -- Authoritative data backbone for Troupe OS
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
--- CREATE EXTENSION IF NOT EXISTS "vector";  -- disabled: not available on Railway managed Postgres
 
 -- =========================
 -- USERS & IDENTITY
