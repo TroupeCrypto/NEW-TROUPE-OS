@@ -106,12 +106,10 @@ CREATE TABLE asset_tags (
     UNIQUE (asset_id, tag)
 );
 
--- NOTE: embedding stored as a float array instead of pgvector::vector(1536)
--- This keeps the data model but drops native vector indexing for now.
 CREATE TABLE asset_embeddings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     asset_id UUID NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-    embedding double precision[], -- was VECTOR(1536)
+    embedding DOUBLE PRECISION[],
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
