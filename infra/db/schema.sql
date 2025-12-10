@@ -95,7 +95,8 @@ CREATE TABLE assets (
     metadata JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ
+    deleted_at TIMESTAMPTZ,
+    CHECK (num_nonnulls(owner_id, organization_id) = 1)
 );
 
 CREATE TABLE asset_tags (
@@ -109,7 +110,7 @@ CREATE TABLE asset_tags (
 CREATE TABLE asset_embeddings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     asset_id UUID NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-    embedding vector(1536),
+    embedding VECTOR(1536),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -135,15 +136,16 @@ CREATE TABLE accounts (
     currency_code TEXT, -- e.g. USD, USDC, ETH
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ
+    deleted_at TIMESTAMPTZ,
+    CHECK (owner_user_id IS NOT NULL OR owner_org_id IS NOT NULL)
 );
 
 -- Core double-entry ledger: every business event must produce at least two entries
 CREATE TABLE ledger_entries (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    transaction_id UUID,
+    transaction_id UUID REFERENCES transactions(id),
     account_id UUID NOT NULL REFERENCES accounts(id),
-    amount NUMERIC(20,8) NOT NULL, -- signed; convention: positive = credit, negative = debit OR vice versa per implementation
+    amount NUMERIC(20,8) NOT NULL CHECK (amount > 0), -- always positive; use is_debit to indicate direction
     is_debit BOOLEAN NOT NULL,
     reference TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -176,7 +178,7 @@ END$$;
 
 CREATE TABLE products (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    asset_id UUID REFERENCES assets(id),
+    asset_id UUID NOT NULL REFERENCES assets(id),
     organization_id UUID REFERENCES organizations(id),
     sku TEXT,
     title TEXT,
@@ -193,13 +195,14 @@ CREATE TABLE orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID REFERENCES users(id),
     organization_id UUID REFERENCES organizations(id),
-    status order_status DEFAULT 'pending',
+    status order_status DEFAULT 'draft',
     currency_code TEXT,
     subtotal NUMERIC(20,8),
     total NUMERIC(20,8),
     metadata JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CHECK (user_id IS NOT NULL OR organization_id IS NOT NULL)
 );
 
 CREATE TABLE order_items (
@@ -210,7 +213,8 @@ CREATE TABLE order_items (
     quantity INT NOT NULL DEFAULT 1,
     unit_price NUMERIC(20,8),
     total_price NUMERIC(20,8),
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CHECK (product_id IS NOT NULL OR asset_id IS NOT NULL)
 );
 
 -- =========================
@@ -308,14 +312,10 @@ CREATE TABLE system_events (
 -- =========================
 
 -- Users & orgs
-CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
-CREATE INDEX IF NOT EXISTS idx_organizations_name ON organizations (name);
 CREATE INDEX IF NOT EXISTS idx_org_members_org ON organization_members (organization_id);
 CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_members (user_id);
 
 -- Roles & permissions
-CREATE INDEX IF NOT EXISTS idx_roles_name ON roles (name);
-CREATE INDEX IF NOT EXISTS idx_permissions_name ON permissions (name);
 CREATE INDEX IF NOT EXISTS idx_role_permissions_role ON role_permissions (role_id);
 CREATE INDEX IF NOT EXISTS idx_role_permissions_permission ON role_permissions (permission_id);
 CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles (user_id);
