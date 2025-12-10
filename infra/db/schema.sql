@@ -106,6 +106,7 @@ CREATE TABLE asset_tags (
     UNIQUE (asset_id, tag)
 );
 
+-- Embeddings stored as DOUBLE PRECISION[] to avoid custom extensions
 CREATE TABLE asset_embeddings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     asset_id UUID NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
