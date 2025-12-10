@@ -25,6 +25,7 @@ $$ LANGUAGE plpgsql;
 CREATE TYPE user_kind AS ENUM ('human', 'ai_agent');
 CREATE TYPE asset_type AS ENUM ('music', 'art', 'collectible', 'nft', 'document', 'other');
 CREATE TYPE asset_status AS ENUM ('draft', 'indexed', 'published', 'on_sale', 'sold', 'archived');
+CREATE TYPE asset_visibility AS ENUM ('public', 'internal', 'private');
 CREATE TYPE account_type AS ENUM ('asset', 'liability', 'equity', 'revenue', 'expense');
 CREATE TYPE account_status AS ENUM ('open', 'suspended', 'closed');
 CREATE TYPE transaction_type AS ENUM ('fiat', 'crypto');
@@ -67,7 +68,10 @@ CREATE TABLE user_identities (
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
     UNIQUE (provider, provider_user_id),
-    UNIQUE (user_id, provider, wallet_address)
+    identity_key TEXT GENERATED ALWAYS AS (CASE WHEN provider = 'wallet' THEN wallet_address ELSE provider_user_id END) STORED NOT NULL,
+    UNIQUE (user_id, provider, identity_key),
+    CHECK ((provider = 'wallet' AND wallet_address IS NOT NULL) OR provider <> 'wallet'),
+    CHECK ((provider <> 'wallet' AND provider_user_id IS NOT NULL) OR provider = 'wallet')
 );
 CREATE TRIGGER trg_user_identities_updated_at BEFORE UPDATE ON user_identities FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE INDEX idx_user_identities_user ON user_identities(user_id);
@@ -113,11 +117,14 @@ CREATE TABLE roles (
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
     deleted_at TIMESTAMPTZ,
-    UNIQUE (name, scope, organization_id)
+    UNIQUE (name, scope, organization_id),
+    CHECK ((scope = 'system' AND organization_id IS NULL) OR (scope = 'organization' AND organization_id IS NOT NULL))
 );
 CREATE TRIGGER trg_roles_updated_at BEFORE UPDATE ON roles FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE INDEX idx_roles_org ON roles(organization_id);
 CREATE INDEX idx_roles_scope ON roles(scope);
+CREATE UNIQUE INDEX idx_roles_system_unique ON roles(name) WHERE scope = 'system';
+CREATE UNIQUE INDEX idx_roles_org_unique ON roles(organization_id, name) WHERE scope = 'organization';
 
 CREATE TABLE permissions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -166,7 +173,7 @@ CREATE TABLE assets (
     storage_uri TEXT,
     checksum TEXT,
     metadata JSONB,
-    visibility TEXT DEFAULT 'private',
+    visibility asset_visibility NOT NULL DEFAULT 'private',
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
     deleted_at TIMESTAMPTZ
@@ -176,6 +183,7 @@ CREATE INDEX idx_assets_org ON assets(organization_id);
 CREATE INDEX idx_assets_owner ON assets(owner_user_id);
 CREATE INDEX idx_assets_type_status ON assets(type, status);
 CREATE INDEX idx_assets_metadata ON assets USING GIN (metadata);
+COMMENT ON COLUMN assets.metadata IS 'Structured asset metadata (traits, links, provenance); validated by service layer per asset type.';
 
 CREATE TABLE asset_attributes (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -201,11 +209,14 @@ CREATE TABLE asset_embeddings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     asset_id UUID NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
     provider TEXT NOT NULL,
-    embedding vector(1536) NOT NULL,
+    embedding vector NOT NULL,
+    dimension INTEGER GENERATED ALWAYS AS (vector_dims(embedding)) STORED,
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now())
 );
 CREATE INDEX idx_asset_embeddings_asset ON asset_embeddings(asset_id);
 CREATE INDEX idx_asset_embeddings_vector ON asset_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+COMMENT ON COLUMN asset_embeddings.dimension IS 'Derived dimensionality for validating provider embeddings and enforcing consistent vector sizes.';
+COMMENT ON INDEX idx_asset_embeddings_vector IS 'IVFFlat cosine index using ~100 lists (roughly sqrt(N)); tune lists per dataset size for recall/performance balance.';
 
 -- =========================
 -- ORGANIZATIONS / GROUPS
@@ -249,14 +260,15 @@ CREATE TABLE accounts (
     parent_account_id UUID REFERENCES accounts(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
-    deleted_at TIMESTAMPTZ,
-    UNIQUE (organization_id, code)
+    deleted_at TIMESTAMPTZ
 );
 CREATE TRIGGER trg_accounts_updated_at BEFORE UPDATE ON accounts FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE INDEX idx_accounts_org ON accounts(organization_id);
 CREATE INDEX idx_accounts_owner ON accounts(owner_user_id);
 CREATE INDEX idx_accounts_parent ON accounts(parent_account_id);
 CREATE INDEX idx_accounts_type ON accounts(type);
+CREATE UNIQUE INDEX idx_accounts_org_code ON accounts(organization_id, code) WHERE organization_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_accounts_system_code ON accounts(code) WHERE organization_id IS NULL;
 
 CREATE TABLE ledger_transactions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -288,13 +300,60 @@ CREATE INDEX idx_ledger_entries_txn ON ledger_entries(ledger_transaction_id);
 CREATE INDEX idx_ledger_entries_account ON ledger_entries(account_id);
 CREATE INDEX idx_ledger_entries_asset ON ledger_entries(asset_id);
 
-ALTER TABLE ledger_transactions
-    ADD CONSTRAINT ledger_txn_balanced
-    CHECK (
-        (SELECT COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount ELSE -amount END), 0)
-         FROM ledger_entries le
-         WHERE le.ledger_transaction_id = id) = 0
-    ) DEFERRABLE INITIALLY DEFERRED;
+CREATE OR REPLACE FUNCTION assert_ledger_balance(txn_id UUID, txn_status ledger_txn_status)
+RETURNS VOID AS $$
+DECLARE
+    txn_balance NUMERIC(32, 8);
+BEGIN
+    IF txn_status = 'posted' THEN
+        SELECT COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount ELSE -amount END), 0)
+        INTO txn_balance
+        FROM ledger_entries
+        WHERE ledger_transaction_id = txn_id;
+
+        IF txn_balance <> 0 THEN
+            RAISE EXCEPTION 'Ledger transaction % is not balanced (%).', txn_id, txn_balance;
+        END IF;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION enforce_balance_from_entries()
+RETURNS TRIGGER AS $$
+DECLARE
+    txn_id UUID := COALESCE(NEW.ledger_transaction_id, OLD.ledger_transaction_id);
+    txn_status ledger_txn_status;
+BEGIN
+    SELECT status INTO txn_status FROM ledger_transactions WHERE id = txn_id;
+    IF txn_status = 'posted' THEN
+        PERFORM assert_ledger_balance(txn_id, txn_status);
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION enforce_balance_from_transactions()
+RETURNS TRIGGER AS $$
+DECLARE
+    txn_id UUID := COALESCE(NEW.id, OLD.id);
+    txn_status ledger_txn_status := COALESCE(NEW.status, OLD.status);
+BEGIN
+    IF txn_status = 'posted' THEN
+        PERFORM assert_ledger_balance(txn_id, txn_status);
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER trg_ledger_entries_balanced
+AFTER INSERT OR UPDATE OR DELETE ON ledger_entries
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_balance_from_entries();
+
+CREATE CONSTRAINT TRIGGER trg_ledger_transactions_balanced
+AFTER INSERT OR UPDATE ON ledger_transactions
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_balance_from_transactions();
 
 -- =========================
 -- TRANSACTIONS (FIAT + CRYPTO)
@@ -324,7 +383,7 @@ CREATE TABLE transactions (
     to_account_id UUID REFERENCES accounts(id),
     ledger_transaction_id UUID REFERENCES ledger_transactions(id) ON DELETE SET NULL,
     wallet_id UUID REFERENCES wallets(id),
-    amount NUMERIC(32, 8) NOT NULL CHECK (amount >= 0),
+    amount NUMERIC(32, 8) NOT NULL CHECK (amount > 0),
     currency CHAR(3) NOT NULL,
     tx_hash TEXT,
     payment_processor TEXT,
@@ -401,6 +460,7 @@ CREATE TRIGGER trg_orders_updated_at BEFORE UPDATE ON orders FOR EACH ROW EXECUT
 CREATE INDEX idx_orders_org ON orders(organization_id);
 CREATE INDEX idx_orders_buyer ON orders(buyer_id);
 CREATE INDEX idx_orders_status ON orders(status);
+COMMENT ON COLUMN orders.shipping_address IS 'Shipping address payload (name, line1, line2, city, region, postal_code, country_code, phone) stored as JSON.';
 
 CREATE TABLE order_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -539,4 +599,3 @@ CREATE TRIGGER trg_automation_jobs_updated_at BEFORE UPDATE ON automation_jobs F
 CREATE INDEX idx_automation_jobs_status ON automation_jobs(status);
 CREATE INDEX idx_automation_jobs_type ON automation_jobs(job_type);
 CREATE INDEX idx_automation_jobs_schedule ON automation_jobs(scheduled_at);
-
